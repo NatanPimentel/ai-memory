@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Added `[handoff] deliver_on_session_start = false` to `.ai-memory.toml` (patch Imobiturbo, #1621). A
+  project that sets it no longer gets its handoff, or the continuity notice, at
+  session start; the handoff is still created when the session ends and stays
+  open for `memory_handoff_accept`. The native hook, the shell and PowerShell
+  scripts and the generated TypeScript integrations send `handoff=0` only when
+  the value is explicitly falsy.
+
 ## [3.2.9] - 2026-10-27
 
 ### Fixed
@@ -879,6 +888,7 @@ version in [`docs/changelog/`](docs/changelog/):
   captured hook output. The error now names the type it found with the value
   replaced by `<redacted>`.
   ([#1565](https://github.com/akitaonrails/ai-memory/pull/1565))
+||||||| parent of 7a26843f (feat(hooks): add [handoff] deliver_on_session_start opt-out)
 
 ## [3.2.1] - 2026-10-22
 

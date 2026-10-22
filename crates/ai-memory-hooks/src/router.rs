@@ -1676,6 +1676,12 @@ pub struct HandoffQuery {
     /// Set falsy by a client that re-fetches on every prompt (Kimi Code) once
     /// the session already received the digest, so it is delivered once.
     pub profile_digest: Option<String>,
+    /// The marker's `[handoff] deliver_on_session_start`, sent as `0` only
+    /// when the project opted out. An explicit falsy value keeps this
+    /// project's handoff and continuity notice out of its session starts: the
+    /// handoff stays open and unclaimed, and the rest of the on-start context
+    /// is delivered as usual. Absent or anything else delivers as before.
+    pub handoff: Option<String>,
 }
 
 impl HandoffQuery {
@@ -1828,16 +1834,24 @@ async fn fetch_and_accept_handoff_at(
     let busy_since = now
         .saturating_sub(LIVE_BATON_QUIET_PERIOD)
         .unwrap_or(jiff::Timestamp::MIN);
-    let handoff = state
-        .reader
-        .startup_handoff(
-            ws,
-            proj,
-            query.cwd.clone(),
-            owner_filter.clone(),
-            busy_since,
-        )
-        .await?;
+    // `[handoff] deliver_on_session_start = false` never reads the baton, so
+    // there is nothing to claim, announce or render; it stays open for a
+    // project that has not opted out (or for `memory_handoff_accept`).
+    let deliver_handoff = !crate::payload::query_flag_falsy(query.handoff.as_deref());
+    let handoff = if deliver_handoff {
+        state
+            .reader
+            .startup_handoff(
+                ws,
+                proj,
+                query.cwd.clone(),
+                owner_filter.clone(),
+                busy_since,
+            )
+            .await?
+    } else {
+        None
+    };
     let claude_capped = agent == AgentKind::ClaudeCode;
     let handoff_md = handoff.as_ref().map(|handoff| {
         render_handoff_markdown_with_budget(handoff, claude_capped.then_some(CLAUDE_HANDOFF_CHARS))
@@ -1901,16 +1915,20 @@ async fn fetch_and_accept_handoff_at(
     // the admission-chain round-trip: the handoff is never claimed, and
     // `handoff_notice` (computed below from the still-open `pending` value,
     // before it is consumed here) is what tells the agent it exists.
-    let continuity_notice = render_continuity_notice(
-        state,
-        &query,
-        ws,
-        proj,
-        owner_filter.clone(),
-        handoff.as_ref().map(|pending| pending.lifecycle.created_at),
-        now,
-    )
-    .await;
+    let continuity_notice = if deliver_handoff {
+        render_continuity_notice(
+            state,
+            &query,
+            ws,
+            proj,
+            owner_filter.clone(),
+            handoff.as_ref().map(|pending| pending.lifecycle.created_at),
+            now,
+        )
+        .await
+    } else {
+        None
+    };
     let handoff_notice = if state.claim_handoff_on_session_start {
         None
     } else {
@@ -5650,6 +5668,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.to_string()),
             workspace: Some("default".into()),
@@ -6459,6 +6478,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             identity: Some(identity.to_owned()),
             identity_src: Some(source.to_owned()),
             aliases: None,
@@ -15079,6 +15099,7 @@ pub(crate) mod tests {
                 profile_contribute: None,
                 profile_consume: None,
                 profile_digest: None,
+                handoff: None,
                 workspace: Some("checkpoint-workspace".into()),
                 project: Some(project.into()),
                 agent: Some("codex".into()),
@@ -15157,6 +15178,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("opencode2".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -15390,6 +15412,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some(agent.into()),
             session_id: Some(session_id),
             ..Default::default()
@@ -15580,6 +15603,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("claude-code".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -16410,6 +16434,7 @@ pub(crate) mod tests {
                     profile_contribute: None,
                     profile_consume: None,
                     profile_digest: None,
+                    handoff: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(tmp.path().to_string_lossy().into_owned()),
                     workspace: Some("default".into()),
@@ -17030,6 +17055,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -17119,6 +17145,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -17227,6 +17254,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -17405,6 +17433,15 @@ pub(crate) mod tests {
     }
 
     async fn session_start_handoff(state: &Arc<HookState>, cwd: &str) -> (String, Duration) {
+        session_start_handoff_for(state, cwd, "scratch", None).await
+    }
+
+    async fn session_start_handoff_for(
+        state: &Arc<HookState>,
+        cwd: &str,
+        project: &str,
+        handoff: Option<&str>,
+    ) -> (String, Duration) {
         let started = std::time::Instant::now();
         let (status, body) = read_handoff_response(
             handle_handoff(
@@ -17413,10 +17450,11 @@ pub(crate) mod tests {
                     profile_contribute: None,
                     profile_consume: None,
                     profile_digest: None,
+                    handoff: handoff.map(str::to_string),
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
                     workspace: Some("default".into()),
-                    project: Some("scratch".into()),
+                    project: Some(project.to_string()),
                     project_src: None,
                     project_strategy: None,
                     briefing: None,
@@ -17438,6 +17476,91 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         (body, started.elapsed())
+    }
+
+    /// `[handoff] deliver_on_session_start = false` (sent as `handoff=0`)
+    /// keeps the baton out of that project's session start without claiming
+    /// it; the same project asking again without the opt-out still gets it.
+    #[tokio::test]
+    async fn handoff_opt_out_leaves_the_baton_open_and_undelivered() {
+        let tmp = TempDir::new().unwrap();
+        let state = state_with_pending_handoff(
+            &tmp,
+            ai_memory_wiki::AdmissionChain::new(Vec::new()).unwrap(),
+        )
+        .await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        for falsy in ["0", "false", "no", "OFF"] {
+            let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", Some(falsy)).await;
+            assert!(
+                !body.contains("HANDOFF-MARKER") && !body.to_lowercase().contains("handoff"),
+                "{falsy}: an opted-out project must receive no handoff or notice: {body}",
+            );
+            assert!(
+                open_handoff_exists(&state).await,
+                "{falsy}: an opted-out start must not claim the baton",
+            );
+        }
+
+        // Control: anything but an explicit falsy value delivers and claims.
+        let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", Some("1")).await;
+        assert!(body.contains("HANDOFF-MARKER"), "{body}");
+        assert!(!open_handoff_exists(&state).await);
+    }
+
+    /// Adversarial: one project's opt-out must not hide or consume another
+    /// project's baton, and the other project's delivery must not touch the
+    /// opted-out project's.
+    #[tokio::test]
+    async fn handoff_opt_out_is_scoped_to_the_requesting_project() {
+        let tmp = TempDir::new().unwrap();
+        let state = state_with_pending_handoff(
+            &tmp,
+            ai_memory_wiki::AdmissionChain::new(Vec::new()).unwrap(),
+        )
+        .await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let other = state
+            .writer
+            .get_or_create_project(state.workspace_id, "project-b".to_string(), None)
+            .await
+            .unwrap();
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: other,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "HANDOFF-B".to_string(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+
+        // scratch opts out; project-b does not.
+        let (scratch, _) = session_start_handoff_for(&state, &cwd, "scratch", Some("0")).await;
+        assert!(!scratch.contains("HANDOFF-MARKER"), "{scratch}");
+        let (b, _) = session_start_handoff_for(&state, &cwd, "project-b", None).await;
+        assert!(b.contains("HANDOFF-B"), "{b}");
+        assert!(
+            !b.contains("HANDOFF-MARKER"),
+            "project-b must never see scratch's baton: {b}"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "project-b's delivery must not consume the opted-out project's baton",
+        );
+
+        // project-b opting out afterwards changes nothing for scratch.
+        let (scratch, _) = session_start_handoff_for(&state, &cwd, "scratch", None).await;
+        assert!(scratch.contains("HANDOFF-MARKER"), "{scratch}");
     }
 
     /// `GET /handoff` is called synchronously by the session-start hook. Under the default
@@ -18422,6 +18545,7 @@ pub(crate) mod tests {
                 profile_contribute: None,
                 profile_consume: None,
                 profile_digest: None,
+                handoff: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
@@ -18505,6 +18629,7 @@ pub(crate) mod tests {
                 profile_contribute: None,
                 profile_consume: None,
                 profile_digest: None,
+                handoff: None,
                 agent: Some("codex".into()),
                 cwd: Some("/repo/api/src".into()),
                 workspace: Some("default".into()),
@@ -18580,6 +18705,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("codex".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -18735,6 +18861,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("codex".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -18857,6 +18984,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -18941,6 +19069,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -19009,6 +19138,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -19173,6 +19303,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some("kimi-code".into()),
             cwd: Some("/repo".into()),
             workspace: Some("default".into()),
@@ -20028,6 +20159,7 @@ pub(crate) mod tests {
                 profile_contribute: None,
                 profile_consume: None,
                 profile_digest: None,
+                handoff: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: None,
@@ -23189,6 +23321,7 @@ pub(crate) mod tests {
                     profile_contribute: None,
                     profile_consume: None,
                     profile_digest: None,
+                    handoff: None,
                     managed_run: Some(run.run_id.to_string()),
                     session_id: Some("private-vendor".into()),
                     cwd: Some(cwd.clone()),
@@ -23259,6 +23392,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
+            handoff: None,
             agent: Some(agent.into()),
             cwd: Some(cwd.into()),
             workspace: None,
